@@ -67,9 +67,21 @@
   (contains [this o]
     (contains? (.data this) o))
 
+  java.lang.Object
+  (equals [this o]
+    (or (identical? this o)
+        (and (set? o)
+             (= o (into #{} this)))))
+  (hashCode [this]
+    (bit-xor (.hashCode data) (.hashCode version)))
+
+  clojure.lang.IHashEq
+  (hasheq [this]
+    (bit-xor (hash data) (hash version)))
+
   clojure.lang.IPersistentCollection
   (equiv [this o]
-    (and (instance? o Orswot)
+    (and (instance? Orswot o)
          (= (.version o) version)
          (= (.data o) data)))
   (cons [this o]
@@ -163,7 +175,7 @@
 
 (defn keyset-of-orswot
   [orswot]
-  (-> orswot :data keys set))
+  (into #{} orswot))
 
 (def keys-added-remain-one-node
   (prop/for-all [v (gen/vector gen/int)]
@@ -174,6 +186,8 @@
                                (orswot-conj orswot (->Dot :node i) k))
                              (orswot)
                              (map vector v (range)))))))
+
+(orswot-conj (orswot) (->Dot :node 0) :foo)
 
 (defn run-ops-as-set
   [ops]
@@ -206,10 +220,9 @@
 (def set-semantics
   (prop/for-all [ops (gen/vector (gen/hash-map :k gen-key
                                                :op gen-biased-op) 10 100)]
-                (run-ops-as-orswot :node ops)
                 (= (run-ops-as-set ops)
-                   #_(keyset-of-orswot
-                     ))))
+                   (keyset-of-orswot
+                     (run-ops-as-orswot :node ops)))))
 
 (def merge-of-peers
   (prop/for-all [ops (gen/vector (gen/hash-map :node gen-node
@@ -249,9 +262,9 @@
 (get (orswot-conj (orswot) (->Dot :node 0) :foo) :foo)
 (comment
   (do
-    (tc/quick-check 1 keys-added-remain-one-node)
-    (tc/quick-check 1 set-semantics)
-    (tc/quick-check 1 merge-of-peers)
-    (tc/quick-check 1 merge-commutative))
+    (tc/quick-check 100 keys-added-remain-one-node)
+    (tc/quick-check 100 set-semantics)
+    (tc/quick-check 100 merge-of-peers)
+    (tc/quick-check 100 merge-commutative))
   )
 
