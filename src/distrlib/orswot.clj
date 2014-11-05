@@ -1,5 +1,5 @@
 (ns distrlib.orswot
-  (:refer-clojure :exclude (get assoc dissoc merge resolve))
+  (:refer-clojure :exclude (resolve))
   (:require [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -25,76 +25,128 @@
 ;; optimized CRDTs, like orswot & dvv use them as well
 (defrecord Dot [node time])
 
+(def ^:dynamic *local-counter*)
+
+(def ^:dynamic *dot* (->Dot :n1 0))
+
+(def ^:dynamic *dot-source*)
+
+(defn current-dot
+  []
+  (cond (bound? #'*dot*) *dot*
+        (bound? #'*dot-source*) (*dot-source*)
+        :else (throw (ex-info "No dot in dynamic binding!" {}))))
+
+(declare orswot-get orswot-conj orswot-disj)
+
 ;; version is a map from node ID to local version
 ;; data is a map from keys to Value pairs
-(defrecord Orswot [version data])
+(deftype Orswot [version data metadata]
+  clojure.lang.IPersistentSet
+  (disjoin [this o]
+    (orswot-disj this (current-dot) o))
+  (get [this o]
+    (println "in get")
+    (orswot-get this o))
+  (contains [this o]
+    (contains? (.data this) o))
 
+  clojure.lang.IPersistentCollection
+  (equiv [this o]
+    (and (instance? o Orswot)
+         (= (.version o) version)
+         (= (.data o) data)))
+  (cons [this o]
+    (println "hello" this o)
+    (orswot-conj this (current-dot) o))
+  (empty [this]
+    (Orswot. version {} metadata))
+
+  clojure.lang.Counted
+  (count [this]
+    (count (.data this)))
+
+  clojure.lang.Seqable
+  (seq [this]
+    (keys data))
+  )
+;;(class (orswot-conj (orswot) (current-dot) :foo))
+;;(.cons (sort (map :name (:members (clojure.reflect/reflect (orswot))))) :foo)
+;
+;;(orswot-conj (orswot) (current-dot) :fee)
+;
+;;(.cons (orswot) :fee)
+;
 (defn orswot
   []
-  (->Orswot {} {}))
+  (Orswot. {} {} nil))
 
-(defn get
+(defn orswot-get
   ([orswot k]
-   (get k nil))
+   (orswot-get orswot k nil))
   ([orswot k default]
-   (get-in orswot [:data k] default)))
+   (println "in orswot-get")
+   (clojure.core/get #spy/d (.data orswot) k default)))
 
-(defn assoc
+(defn orswot-conj
   "Takes an orswot, a node, a local-version, and list of key value pairs"
   ([orswot dot k]
 ;;     (assert (< (get-in orswot [:version node] -1) local-version))
-   (let [version' (clojure.core/assoc (:version orswot) (:node dot) (:time dot))
-         data' (clojure.core/assoc (:data orswot) k dot)]
-     (->Orswot version' data')))
-  ([orswot dot k & more]
-   (reduce #(assoc %1 dot) (assoc orswot dot k) more)))
+   (let [version' (clojure.core/assoc (.version orswot) (:node dot) (:time dot))
+         data' (clojure.core/assoc (.data orswot) k dot)]
+     (println "Returning orswot with" version' "and" data')
+     (Orswot. version' data' (.metadata orswot))))
+  ;;TODO is this arity needed?
+  #_([orswot dot k & more]
+   (reduce #(orswot-conj %1 dot %2) (assoc orswot-conj dot k) more)))
 
-(defn dissoc
+(defn orswot-disj
   [orswot dot k]
   ;; TODO: make these asserts validate at a higher level
  ;; (assert (< (get-in orswot [:version node] -1) local-version))
-  (let [version' (clojure.core/assoc (:version orswot) (:node dot) (:time dot))
-        data' (clojure.core/dissoc (:data orswot) k)]
-    (->Orswot version' data')))
+  (let [version' (clojure.core/assoc (.version orswot) (:node dot) (:time dot))
+        data' (clojure.core/dissoc (.data orswot) k)]
+    (Orswot. version' data' (.metadata orswot))))
 
 (extend-type Orswot
   CRDT
   (resolve* [orswot1 orswot2]
-    (let [keys-in-left (:data orswot1)
-          keys-in-right (:data orswot2)
+    (let [keys-in-left (.data orswot1)
+          keys-in-right (.data orswot2)
           only-in-left (remove (partial contains? keys-in-right) (keys keys-in-left))
           only-in-right (remove (partial contains? keys-in-left) (keys keys-in-right))
           kept-left (filter (fn [k]
                               (let [{:keys [node time]} (clojure.core/get keys-in-left k)]
-                                (> time (get-in orswot2 [:version node] -1))))
+                                (> time (clojure.core/get (.version orswot2) node -1))))
                             only-in-left)
           kept-right (filter (fn [k]
                                (let [{:keys [node time]} (clojure.core/get keys-in-right k)]
-                                 (> time (get-in orswot1 [:version node] -1))))
+                                 (> time (clojure.core/get (.version orswot1) node -1))))
                              only-in-right)
           keys-in-both (filter (partial contains? keys-in-right) (keys keys-in-left))
-          merged-version (merge-with max (:version orswot1 -1) (:version orswot2 -1))
+          merged-version (merge-with max (.version orswot1) (.version orswot2))
           ;;TODO handle value conflicts
           merged-both (clojure.core/merge (select-keys keys-in-left (concat kept-left keys-in-both))
                                           (select-keys keys-in-right kept-right))]
-      (->Orswot merged-version merged-both))))
+      (Orswot. merged-version merged-both (clojure.core/merge (.metadata orswot1)
+                                                  (.metadata orswot2))))))
 
 (def x1 (-> (orswot)
-            (assoc (->Dot :n1 0) "hello")))
+            (clojure.core/conj  "hello")))
 
 (def x2 (-> (orswot)
-            (assoc (->Dot :n3 0) "привет")
-            (assoc (->Dot :n2 1) "hi")
+            (orswot-conj (->Dot :n3 0) "привет")
+            (orswot-conj (->Dot :n2 1) "hi")
             ))
 
 (def x3
   (-> (orswot)
-      (assoc (->Dot :n2 1) "hi")
-      (dissoc (->Dot :n2 2) "hi")
+      (orswot-conj (->Dot :n2 1) "hi")
+      (orswot-disj (->Dot :n2 2) "hi")
       ))
 
-(keys (:data (resolve x1 x2)))
-(keys (:data (resolve x1 x2 x3)))
+(keys (.data (resolve x1 x2)))
+(keys (.data (resolve x1 x2 x3)))
 
 (defn keyset-of-orswot
   [orswot]
@@ -102,12 +154,16 @@
 
 (def keys-added-remain-one-node
   (prop/for-all [v (gen/vector gen/int)]
+                (println "lolol")
                 (= (set v)
                    (keyset-of-orswot
-                     (reduce (fn [orswot [k i]]
-                               (assoc orswot (->Dot :node i) k))
+                     (doto (reduce (fn [orswot [k i]]
+                               (orswot-conj orswot (->Dot :node i) k))
                              (orswot)
-                             (map vector v (range)))))))
+                             (map vector v (range)))
+                       (-> (.version) (println "v"))
+                       (-> (.data) (println "d"))
+                       )))))
 
 (defn run-ops-as-set
   [ops]
@@ -123,8 +179,8 @@
   [node ops]
   (reduce (fn [orswot {:keys [k op i]}]
                                (case op
-                                 :add (assoc orswot (->Dot node i) k)
-                                 :remove (dissoc orswot (->Dot node i) k)
+                                 :add (orswot-conj orswot (->Dot node i) k)
+                                 :remove (orswot-disj orswot (->Dot node i) k)
                                  :noop orswot))
                              (orswot)
                              (map #(clojure.core/assoc %1 :i %2) ops (range))))
@@ -179,6 +235,7 @@
                   (= (keyset-of-orswot (apply resolve orswots))
                      (keyset-of-orswot (apply resolve permuted))))))
 
+(get (conj (orswot) :foo) :foo)
 (comment
   (do
     (tc/quick-check 100 keys-added-remain-one-node)
