@@ -1,6 +1,13 @@
 (ns distrlib.orswot
   (:refer-clojure :exclude (resolve)))
 
+;; Ideas:
+;; - Update operations should only take the node, not the time, because the time
+;; is implied by the version vector of the update (maybe not true; try to prove)
+;; - Version vector can live outside any specific CRDT for efficiency/sharing in
+;; combined structures (could be hard b/c orswot leverages this heavily?)
+;; - share code between DVV, orswot, and ormwot
+
 (defprotocol CRDT
   (resolve* [r1 r2] "Merges 2 instances of a CRDT")
   ;;TODO how to handle shared version vectors in composites?
@@ -108,14 +115,14 @@
   ([orswot k]
    (orswot-get orswot k nil))
   ([orswot k default]
-   (clojure.core/get (.data orswot) k default)))
+   (get (.data orswot) k default)))
 
 (defn orswot-conj
   "Takes an orswot, a node, a local-version, and list of key value pairs"
   ([orswot dot k]
 ;;     (assert (< (get-in orswot [:version node] -1) local-version))
-   (let [version' (clojure.core/assoc (.version orswot) (:node dot) (:time dot))
-         data' (clojure.core/assoc (.data orswot) k dot)]
+   (let [version' (assoc (.version orswot) (:node dot) (:time dot))
+         data' (assoc (.data orswot) k dot)]
      (Orswot. version' data' (.metadata orswot))))
   ([orswot dot k & more]
    (reduce #(orswot-conj %1 dot %2) (orswot-conj dot k) more)))
@@ -124,8 +131,8 @@
   ([orswot dot k]
    ;; TODO: make these asserts validate at a higher level
    ;; (assert (< (get-in orswot [:version node] -1) local-version))
-   (let [version' (clojure.core/assoc (.version orswot) (:node dot) (:time dot))
-         data' (clojure.core/dissoc (.data orswot) k)]
+   (let [version' (assoc (.version orswot) (:node dot) (:time dot))
+         data' (dissoc (.data orswot) k)]
      (Orswot. version' data' (.metadata orswot))))
   ([orswot dot k & ks]
    (reduce #(orswot-disj %1 dot %2) (orswot-disj dot k) ks)))
@@ -137,17 +144,17 @@
         only-in-left (remove (partial contains? keys-in-right) (keys keys-in-left))
         only-in-right (remove (partial contains? keys-in-left) (keys keys-in-right))
         kept-left (filter (fn [k]
-                            (let [{:keys [node time]} (clojure.core/get keys-in-left k)]
-                              (> time (clojure.core/get (.version orswot2) node -1))))
+                            (let [{:keys [node time]} (get keys-in-left k)]
+                              (> time (get (.version orswot2) node -1))))
                           only-in-left)
         kept-right (filter (fn [k]
-                             (let [{:keys [node time]} (clojure.core/get keys-in-right k)]
-                               (> time (clojure.core/get (.version orswot1) node -1))))
+                             (let [{:keys [node time]} (get keys-in-right k)]
+                               (> time (get (.version orswot1) node -1))))
                            only-in-right)
         keys-in-both (filter (partial contains? keys-in-right) (keys keys-in-left))
         merged-version (merge-with max (.version orswot1) (.version orswot2))
         ;;TODO handle value conflicts
-        merged-both (clojure.core/merge (select-keys keys-in-left (concat kept-left keys-in-both))
-                                        (select-keys keys-in-right kept-right))]
-    (Orswot. merged-version merged-both (clojure.core/merge (.metadata orswot1)
-                                                            (.metadata orswot2)))))
+        merged-both (merge (select-keys keys-in-left (concat kept-left keys-in-both))
+                           (select-keys keys-in-right kept-right))]
+    (Orswot. merged-version merged-both (merge (.metadata orswot1)
+                                               (.metadata orswot2)))))
