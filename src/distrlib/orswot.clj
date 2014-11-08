@@ -26,6 +26,58 @@
 ;; optimized CRDTs, like orswot & dvv use them as well
 (defrecord Dot [node time])
 
+(defrecord Version [])
+
+(defn dot?
+  [x]
+  (instance? Dot x))
+
+(defn version?
+  [x]
+  (instance? Version x))
+
+;; TODO these 3 should work for all combinations of versions and dots
+;; case 1: 2 versions
+;; case 2: 2 dots
+;; case 3: version + dot should try to cast the version to a dot, then compare there
+
+(defn cast-version-to-dot
+  "Tries to extract the relevant dot from the version that matches the given
+   node."
+  [node version]
+  (when-let [time (get version node)]
+    (->Dot node time)))
+
+(defn before?
+  "Returns true if this happened before or equal to that"
+  [this that]
+  (cond
+    (and (dot? this) (dot? that)) (and (= (:node this) (:node that))
+                                       (<= (:time this) (:time that)))
+    (and (version? this) (version? that)) (reduce (fn [b k]
+                                                    (and b (<= (get this k)
+                                                              (get that k))))
+                                                  true
+                                                  (keys this))
+    (and (dot? this) (version? that)) (before? this (cast-version-to-dot
+                                                      (:node this) that))
+    (and (version? this) (dot? that)) (before? (cast-version-to-dot
+                                                 (:node that) this)
+                                               that)))
+
+(defn after?
+  "Returns true if this happened after that"
+  [this that])
+
+(defn concurrent?
+  "Returns true if this happened concurrently with that"
+  [this that])
+
+(defn update-version
+  "Takes a version and a dot, and increases the version"
+  []
+  )
+
 (def ^:dynamic *local-counter*)
 
 (def ^:dynamic *dot* (->Dot :n1 0))
