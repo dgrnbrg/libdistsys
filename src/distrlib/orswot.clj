@@ -1,5 +1,5 @@
 (ns distrlib.orswot
-  (:refer-clojure :exclude (resolve)))
+  (:require [distrlib.crdt :as crdt]))
 
 ;; Ideas:
 ;; - Update operations should only take the node, not the time, because the time
@@ -10,66 +10,9 @@
 
 ;; Add support for context-based removes; requires support deferred opertations
 
-(defprotocol CRDT
-  (resolve* [r1 r2] "Merges 2 instances of a CRDT")
-  ;;TODO how to handle shared version vectors in composites?
-  )
-
-(defn resolve
-  "Given CRDTs, it combines them."
-  ([] nil)
-  ([crdt1] crdt1)
-  ([crdt1 crdt2] (resolve* crdt1 crdt2))
-  ([crdt1 crdt2 & more]
-   (reduce resolve (resolve crdt1 crdt2) more)))
-
 ;; A dot is a node & a local time for that node.
 ;; version vectors are collections of dots. some
 ;; optimized CRDTs, like orswot & dvv use them as well
-(defrecord Dot [node time])
-
-(defn dot?
-  [x]
-  (instance? Dot x))
-
-;;; vector clock is a map from node to time
-;;; must be able to add a dot to a version
-;;; must be able to get the time of a node in a version
-;;; must be able to merge versions
-;;; must be able to drop dots that are dominated by a vclock
-
-(defn vclock-merge
-  [& vclocks]
-  (apply merge-with max vclocks))
-
-(defn vclock-inc
-  [vclock node]
-  (update-in vclock [node] (fnil inc 0)))
-
-(defn vclock-prune
-  "Returns the left-side vclock without all entries that
-   are dominated by the right-side vclock (used for keeping dotted
-   elements small and causal)"
-  [lvclock rvclock]
-  (reduce-kv (fn [new-vclock left-node time]
-               (if (>= (get rvclock left-node -1) time)
-                 new-vclock
-                 (assoc new-vclock left-node time)))
-             {}
-             lvclock))
-
-(defn vclock-descends
-  "Returns true if va is a direct descendent of vb. A vclock is its own descendent."
-  [va vb]
-  (if (empty? vb)
-    true
-    (every? #(<= (val %) (get va (key %) -1)) vb)))
-
-(def ^:dynamic *current-node* (java.util.UUID/randomUUID))
-
-(defmacro with-node
-  [node & body]
-  `(binding [*current-node* ~node] ~@body))
 
 (declare orswot-get orswot-conj orswot-disj orswot-resolve)
 
@@ -83,7 +26,7 @@
 (deftype Orswot [version data metadata]
   clojure.lang.IPersistentSet
   (disjoin [this o]
-    (orswot-disj this *current-node* o))
+    (orswot-disj this crdt/*current-node* o))
   (get [this o]
     (orswot-get this o))
   (contains [this o]
@@ -107,10 +50,9 @@
          (= (.version o) version)
          (= (.data o) data)))
   (cons [this o]
-    (orswot-conj this *current-node* o))
+    (orswot-conj this crdt/*current-node* o))
   (empty [this]
-    ;;TODO should this increment the version, too?
-    (Orswot. version {} metadata))
+    (Orswot. (crdt/vclock-inc version crdt/*current-node*) {} metadata))
 
   clojure.lang.Counted
   (count [this]
@@ -120,7 +62,8 @@
   (seq [this]
     (keys data))
   
-  CRDT
+  crdt/CRDT
+  (type [this] :crdt/orswot)
   (resolve* [orswot1 orswot2]
     (when-not (instance? Orswot orswot2)
       (throw (ex-info "2nd argument must also be an orswot" {:orswot2 orswot2})))
@@ -142,10 +85,10 @@
 (defn orswot-conj
   "Takes an orswot, a node, a local-version, and list of key value pairs"
   ([orswot node k]
-   (let [version' (vclock-inc (.version orswot) node)
+   (let [version' (crdt/vclock-inc (.version orswot) node)
          data' (update-in (.data orswot)
                           [k]
-                          (fnil vclock-merge {})
+                          (fnil crdt/vclock-merge {})
                           {node (get version' node)})]
      (Orswot. version' data' (.metadata orswot))))
   ([orswot node k & more]
@@ -155,7 +98,7 @@
   ([orswot node k]
    ;; TODO: make these asserts validate at a higher level
    ;; (assert (< (get-in orswot [:version node] -1) local-version))
-   (let [version' (vclock-inc (.version orswot) node)
+   (let [version' (crdt/vclock-inc (.version orswot) node)
          data' (dissoc (.data orswot) k)]
      (Orswot. version' data' (.metadata orswot))))
   ([orswot node k & ks]
@@ -164,9 +107,9 @@
 (defn orswot-merge-disjoint-keys
   [unique-data other-side-clock result]
   (reduce-kv (fn [result unique-key unique-vclock]
-               (if (vclock-descends other-side-clock unique-vclock)
+               (if (crdt/vclock-descends other-side-clock unique-vclock)
                  result
-                 (assoc result unique-key (vclock-prune unique-vclock other-side-clock))))
+                 (assoc result unique-key (crdt/vclock-prune unique-vclock other-side-clock))))
              result
              unique-data))
 
@@ -182,9 +125,9 @@
                                             right-dots)
                      left-unique (apply dissoc left-dots (keys common-dots))
                      right-unique (apply dissoc right-dots (keys common-dots))
-                     left-keep (vclock-prune left-unique right-version)
-                     right-keep (vclock-prune right-unique left-version)
-                     new-dots (vclock-merge common-dots left-keep right-keep)]
+                     left-keep (crdt/vclock-prune left-unique right-version)
+                     right-keep (crdt/vclock-prune right-unique left-version)
+                     new-dots (crdt/vclock-merge common-dots left-keep right-keep)]
                  (if (empty? new-dots)
                    (dissoc result key)
                    (assoc result key new-dots))))
@@ -198,7 +141,7 @@
         only-in-left (remove (partial contains? keys-in-right) (keys keys-in-left))
         only-in-right (remove (partial contains? keys-in-left) (keys keys-in-right))
         keys-in-both (filter (partial contains? keys-in-right) (keys keys-in-left))
-        merged-version (vclock-merge (.version orswot1) (.version orswot2))
+        merged-version (crdt/vclock-merge (.version orswot1) (.version orswot2))
         merged-data (orswot-merge-disjoint-keys
                       (select-keys keys-in-left only-in-left)
                       (.version orswot2)

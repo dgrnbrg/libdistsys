@@ -1,6 +1,5 @@
 (ns distrlib.pn-counter
-  
-  )
+ (:require [distrlib.crdt :as crdt]))
 
 ;;; We'll represent a PN Counter as a pair of g-counters, each of those
 ;;; being represented as a map.
@@ -13,7 +12,13 @@
   [gcounter]
   (apply + (vals gcounter)))
 
-(defrecord PNCounter [incs decs])
+(declare combine)
+
+(defrecord PNCounter [incs decs]
+  crdt/CRDT
+  (type [this] :crdt/pn-counter)
+  (resolve* [r1 r2]
+    (combine r1 r2)))
 
 (defn pn-counter
   []
