@@ -12,14 +12,14 @@
             (clojure.core/conj  "hello")))
 
 (def x2 (-> (orswot)
-            (orswot-conj (->Dot :n3 0) "привет")
-            (orswot-conj (->Dot :n2 1) "hi")
+            (orswot-conj :n3 "привет")
+            (orswot-conj :n2 "hi")
             ))
 
 (def x3
   (-> (orswot)
-      (orswot-conj (->Dot :n2 1) "hi")
-      (orswot-disj (->Dot :n2 2) "hi")
+      (orswot-conj :n2 "hi")
+      (orswot-disj :n2 "hi")
       ))
 
 (deftest basic-resolving
@@ -35,11 +35,11 @@
                 (= (set v)
                    (keyset-of-orswot
                      (reduce (fn [orswot [k i]]
-                               (orswot-conj orswot (->Dot :node i) k))
+                               (orswot-conj orswot :node k))
                              (orswot)
                              (map vector v (range)))))))
 
-(orswot-conj (orswot) (->Dot :node 0) :foo)
+(orswot-conj (orswot) :node :foo)
 
 (defn run-ops-as-set
   [ops]
@@ -55,8 +55,8 @@
   [node ops]
   (reduce (fn [orswot {:keys [k op i]}]
                                (case op
-                                 :add (orswot-conj orswot (->Dot node i) k)
-                                 :remove (orswot-disj orswot (->Dot node i) k)
+                                 :add (orswot-conj orswot node k)
+                                 :remove (orswot-disj orswot node k)
                                  :noop orswot))
                              (orswot)
                              (map #(clojure.core/assoc %1 :i %2) ops (range))))
@@ -97,7 +97,7 @@
   (prop/for-all [ops (gen/vector (gen/hash-map :node gen-node
                                                :k gen-key
                                                :op gen-biased-op) 10 1000)
-                 knuth-suffle (apply gen/tuple (map gen/elements (prefixes (range (count the-nodes)))))]
+                 knuth-shuffle (apply gen/tuple (map gen/elements (prefixes (range (count the-nodes)))))]
                 (let [orswots (->> (concat (map #(hash-map :op :noop :node %) the-nodes)
                                            ops)
                                    (group-by :node)
@@ -107,11 +107,11 @@
                                                              i (nth perm j)
                                                              j (nth perm i)))
                                        (vec orswots)
-                                       (map vector (range) knuth-suffle))]
+                                       (map vector (range) knuth-shuffle))]
                   (= (keyset-of-orswot (apply resolve orswots))
                      (keyset-of-orswot (apply resolve permuted))))))
 
-(get (orswot-conj (orswot) (->Dot :node 0) :foo) :foo)
+(get (orswot-conj (orswot) :node :foo) :foo)
 
 (defspec check-basic-add-keys
   1000
@@ -128,3 +128,68 @@
 (defspec check-merge-is-commutative
   1000
   merge-commutative)
+
+(deftest vclock-compare
+  (is (vclock-descends {:a 0 :b 0} {:a 0 :b 0}))
+  (is (vclock-descends {:a 0 :b 0} {}))
+  (is (vclock-descends {:a 3 :b 3} {:a 1}))
+  (is (vclock-descends {:a 3 :b 3} {:a 3}))
+  (is (not (vclock-descends {:a 3 :b 3} {:a 3 :c 1})))
+  (is (not (vclock-descends {:a 3 :b 3} {:a 4 :b 1}))))
+
+(deftest vclock-pruning
+  (is (= {} (vclock-prune {:a 2 :b 2} {:a 3 :b 2})))
+  (is (= {} (vclock-prune {:a 2 :b 2} {:a 3 :b 3})))
+  (is (= {:a 3} (vclock-prune {:a 3 :b 2} {:a 2 :b 3}))))
+
+(deftest opposites-removal
+  (let [s (orswot)
+        s-a (orswot-conj s :a :foo)
+        s-b (orswot-conj s :b :bar)
+        s-a' (orswot-disj s-a :b :bar)
+        s-b' (orswot-disj s-b :a :foo)
+        final (resolve s-a' s-b')]
+    (is (= (set s-a') #{:foo}))
+    (is (= (set s-b') #{:bar}))
+    (is (= (set final) #{}))))
+
+(deftest stats-test
+  (let [s (orswot)
+        s1 (orswot-conj s 1 :foo)
+        s2 (orswot-conj s1 2 :foo)
+        s3 (orswot-conj s2 3 :bar)
+        s4 (orswot-disj s3 1 :foo)]
+    (is (= {:actor-count 0 :element-count 0 :max-dot-length 0}
+           (orswot-stats s)))
+    (is (= 3 (:actor-count (orswot-stats s4))))
+    (is (= 1 (:element-count (orswot-stats s4))))
+    (is (= 1 (:max-dot-length (orswot-stats s4))))))
+
+(deftest disjoint-merge-test
+  (let [a1 (orswot-conj (orswot) 1 :bar)
+        b1 (orswot-conj (orswot) 2 :baz)
+        c (resolve a1 b1)
+        a2 (orswot-disj a1 1 :bar)
+        d (resolve a2 c)]
+    (is (= #{:baz} (set d)))))
+
+(deftest present-but-removed-test
+  (let [a (orswot-conj (orswot) :a :Z)
+        c a
+        a2 (orswot-disj a :a :Z)
+        b (orswot-conj (orswot) :b :Z)
+        a3 (resolve b a2)
+        b2 (orswot-disj b :b :Z)
+        merged (resolve a3 c b2)]
+    (is (= (set merged) #{}))))
+
+(deftest no-dots-left-test
+  (let [a (orswot-conj (orswot) :a :Z)
+        b (orswot-conj (orswot) :b :Z)
+        c a
+        a2 (orswot-disj a :a :Z)
+        a3 (resolve a2 b)
+        b2 (orswot-disj b :b :Z)
+        b3 (resolve b2 c)
+        merged (resolve a3 b3 c)]
+    (is (= #{} (set merged)))))
