@@ -53,4 +53,3 @@
 (defmacro with-node
   [node & body]
   `(binding [*current-node* ~node] ~@body))
-
