@@ -5,5 +5,5 @@
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :jvm-opt ["-XX:-OmitStackTraceInFastThrow"]
   :dependencies [[org.clojure/clojure "1.6.0"]
-                 [org.clojure/test.check "0.5.9"]
+                 [org.clojure/test.check "0.6.1"]
                  [potemkin "0.3.11"]])

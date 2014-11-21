@@ -89,27 +89,19 @@
                           (map (fn [[node ops]] (run-ops-as-orswot node ops)))
                           (apply crdt/resolve))))))
 
-(defn prefixes
-  [s]
-  (map #(take (inc %) s) (range (count s))))
-
 (def merge-commutative
   (prop/for-all [ops (gen/vector (gen/hash-map :node gen-node
                                                :k gen-key
                                                :op gen-biased-op) 10 1000)
-                 knuth-shuffle (apply gen/tuple (map gen/elements (prefixes (range (count the-nodes)))))]
+                 [node-perm-1 node-perm-2] (gen/such-that (fn [[l r]] (not= l r))
+                                                          (gen/tuple (gen/shuffle the-nodes) (gen/shuffle the-nodes)))]
                 (let [orswots (->> (concat (map #(hash-map :op :noop :node %) the-nodes)
                                            ops)
                                    (group-by :node)
-                                   (map (fn [[node ops]] (run-ops-as-orswot node ops))))
-                      permuted (reduce (fn [perm [i j]]
-                                         (clojure.core/assoc perm
-                                                             i (nth perm j)
-                                                             j (nth perm i)))
-                                       (vec orswots)
-                                       (map vector (range) knuth-shuffle))]
-                  (= (keyset-of-orswot (apply crdt/resolve orswots))
-                     (keyset-of-orswot (apply crdt/resolve permuted))))))
+                                   (map (fn [[node ops]] [node (run-ops-as-orswot node ops)]))
+                                   (into {}))]
+                  (= (keyset-of-orswot (apply crdt/resolve (map orswots node-perm-1)))
+                     (keyset-of-orswot (apply crdt/resolve (map orswots node-perm-2)))))))
 
 (get (orswot-conj (orswot) :node :foo) :foo)
 
