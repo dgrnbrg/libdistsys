@@ -6,4 +6,5 @@
   :jvm-opt ["-XX:-OmitStackTraceInFastThrow"]
   :dependencies [[org.clojure/clojure "1.6.0"]
                  [org.clojure/test.check "0.6.1"]
+                 [org.clojure/data.priority-map "0.0.5"]
                  [potemkin "0.3.11"]])
