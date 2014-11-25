@@ -86,7 +86,7 @@
            state' (if (contains? state msg-stamp)
                     state
                     (conj state msg-stamp))
-           fwd-peers (take (inc (long (Math/ceil (count peers))))
+           fwd-peers (take (+ 2 (long (Math/ceil (Math/log (count peers)))))
                            (nth-permutation peers (hash simulator-state)))
            fwd-msgs (map (fn [p] (sim/message p :stamp msg-stamp)) fwd-peers)]
        [state' (when (not= state state') fwd-msgs)]))))
@@ -110,5 +110,5 @@
                        ))))
 
 (defspec check-simple-gossip-network
-  1000
+  10000
   simple-gossip-network)

@@ -20,6 +20,10 @@
       (apply assoc m kvs)
       m)))
 
+(defn timeout?
+  [t]
+  (instance? Timeout t))
+
 (let [a (atom 0)]
   (defn unique
     []
@@ -34,12 +38,18 @@
           m
           (partition 2 kvs)))
 
+(defn network-delay
+  [seed]
+  (+ (if (zero? (mod seed 2))
+       1
+       500) (mod seed 10)))
+
 (defn fixup-events
   [node now events]
   (map (fn [e]
          (assoc (cond
                   (instance? Message e)
-                  (assoc-if-nil e :time (inc now)) ; deliver next cycle
+                  (assoc-if-nil e :time (+ (network-delay (hash [node now e])) 50 now))
                   (instance? Timeout e)
                   (-> e
                       (assoc-if-nil :dest node)
@@ -48,7 +58,7 @@
                 :id (unique)))
        events))
 
-(defrecord SimulatorState [^long time ^long seed])
+(defrecord SimulatorState [^long time ^long seed node])
 ;;TODO stick this record into every actor callback arg
 ;;ensure that the run lets you prepopulate this state w/ whatever crap you want
 ;;perhaps a seed should be stored here, too, since we'd really like to have
@@ -77,7 +87,8 @@
                          (let [node (:dest e)
                                actor (get actors node)
                                node-state (get state node)
-                               [node-state' new-events] (actor node-state (->SimulatorState current-time seed) e)
+                               ;_ (println "event" e "node" node "actor" (boolean actor) )
+                               [node-state' new-events] (actor node-state (->SimulatorState current-time seed node) e)
                                fixed-events (fixup-events node current-time new-events)]
                            [(assoc state node node-state')
                             (into events fixed-events)]))
@@ -88,3 +99,9 @@
                next-time (:time (first (vals next-events)) -1)]
            (recur next-time current-time (inc iters) next-state next-events))
          [prev-time current-node-states])))))
+
+
+;;; TODO: make a visual environment that shows the execution traces rendered as graphs/timeseries
+;;; Need a way to generate logs and view them efficiently on the trace. We'll do this by buffering each step in memory, and then flushing out to a log file (leveldb or sqlite). We'll be able to then serve up the log through another module, which initially will give you a table control that lets you scroll through all events & hover to get datastructure details
+;;; Use https://highlightjs.org/usage/ for datastructure higlighting?
+;;; Should capture every time an event runs, in order. Info includes the node, the message, the time, the start & end state, every log inside the actor, and all generated messages. Should use clojure.tools.logging but need to include richer tracking metadata to ensure the log is useful for the analyzer (in text or db?)
