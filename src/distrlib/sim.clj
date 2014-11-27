@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [shuffle])
   (:require [clojure.data.priority-map :refer (priority-map-keyfn)]
             [yesql.core :refer (defqueries)]
+            [clojure.string :as str]
             [schema.core :as s]
             [clojure.java.jdbc :as jdbc])
   (:import com.mchange.v2.c3p0.ComboPooledDataSource))
@@ -180,6 +181,7 @@
     :primary_events
     ;;TODO store delay upfront?
     [:sender_state :int] ;; id of state of sending node
+    [:destination_node :int] ;; who should recieve this?
     [:reciever_state :int] ;; id of state of receiving node, set upon delivery
     (sim-schema->ddl schema)))
 
@@ -208,15 +210,42 @@
 
 (defqueries "sql/queries.sql")
 
+;;; TODO put a cache on some wrapped db fns, like find-node-in-db
+
+(defn lookup-node-name->id
+  "Converts a node name to an id"
+  [db node-name]
+  (-> (lookup-node-name->id* db (name node-name))
+      first
+      :rowid))
+
+(defn lookup-node-id->name
+  "Converts a node id to a name"
+  [db node-id]
+  (-> (lookup-node-id->name* db node-id)
+      first
+      :name))
+
 (defn store-state-for-node!
   [db schema sim-time sim-step node state]
-  (let [[{id :rowid}] (find-node-id db (name node))]
+  (let [id (lookup-node-name->id db node)]
     (-> (jdbc/insert! db :primary_state (serialize-map
                                       {:time sim-time
                                        :step sim-step
                                        :node id}
                                       schema
                                       state))
+        first
+        (get (keyword "last_insert_rowid()")))))
+
+(defn insert-event!
+  [db event-schema event sender-state]
+  (let [dest-id (lookup-node-name->id db (:dest event))]
+    (-> (jdbc/insert! db :primary_events (serialize-map
+                                           {:sender_state sender-state
+                                            :destination_node dest-id}
+                                           event-schema
+                                           (dissoc (into {} event) :time :dest :id)))
         first
         (get (keyword "last_insert_rowid()")))))
 
@@ -230,11 +259,21 @@
   [db nodes]
   (apply jdbc/insert! db :node_names (map (fn [n] {:name (name n)}) nodes)))
 
+(defn remove-nil-values
+  [m]
+  (reduce-kv (fn [m k v]
+               (if-not (nil? v)
+                 (assoc m k v)
+                 m))
+             {}
+             m))
+
 (defn get-all-states
   "Returns all the state data, joined with node names"
   [db schema]
   (map #(-> (deserialize-map schema %)
-            (dissoc :node))
+            (dissoc :node)
+            (remove-nil-values))
        (get-all-states* db)))
 
 (defn latest-state-id-for-node
@@ -243,6 +282,24 @@
   (-> (latest-state-id-for-node* db (name node-name) time)
       (first)
       (:rowid)))
+
+(defn get-all-events
+  [db event-schema state-schema]
+  (->> (get-all-events* db)
+       (map (fn [raw-event]
+              (let [sender-state (-> (first (get-state-by-state-id db (:sender_state raw-event)))
+                                     (update-in [:node] (partial lookup-node-id->name db))
+                                     (remove-nil-values))
+                    recvr-state (-> (first (get-state-by-state-id db (:reciever_state raw-event)))
+                                    (update-in [:node] (partial lookup-node-id->name db))
+                                    (remove-nil-values))]
+                (-> raw-event
+                    (dissoc :sender_state :destination_node :reciever_state)
+                    (assoc :sender sender-state
+                           :reciever recvr-state
+                           :dest (lookup-node-id->name
+                                   db (:destination_node raw-event)))
+                    (remove-nil-values)))))))
 
 (defn sqlite-db-spec
   "Returns a db spec for a sqlite db"
@@ -264,6 +321,21 @@
                (.setMaxIdleTime (* 3 60 60)))]
     {:datasource cpds}))
 
+;; Taken from http://stackoverflow.com/a/14488425
+(defn dissoc-in
+  "Dissociates an entry from a nested associative structure returning a new
+  nested structure. keys is a sequence of keys. Any empty maps that result
+  will not be present in the new structure."
+  [m [k & ks :as keys]]
+  (if ks
+    (if-let [nextmap (get m k)]
+      (let [newmap (dissoc-in nextmap ks)]
+        (if (seq newmap)
+          (assoc m k newmap)
+          (dissoc m k)))
+      m)
+    (dissoc m k)))
+
 (defn init-db
   "Intializes the sqlite db and returns the connection or nil if not configured"
   [config]
@@ -281,10 +353,54 @@
         (state-table (:state-schema config))
         (event-table (:event-schema config)))
       (populate-node-table! db (keys (:actors config)))
-      (.start (Thread. (fn []
-                         (while true
-                           (let [f (.take q)]
-                             (f db))))))
+      (.start
+        (Thread.
+          (fn []
+            (loop [state {:node-states {}
+                          :undelivered-events {}}]
+              (let [reqs (loop [buf []]
+                           (let [e (.take q)]
+                             (if (= e :flush)
+                               buf
+                               (recur (conj buf e)))))]
+                (println "Flushing these reqs:" reqs)
+                (recur
+                  (let [t-con db]
+                    (reduce (fn [new-state [action args]]
+                              (case action
+                                :store-state-for-node
+                                (assoc-in new-state
+                                          [:node-states (:node args)]
+                                          (store-state-for-node!
+                                            t-con
+                                            (:state-schema config)
+                                            (:sim-time args)
+                                            (:sim-step args)
+                                            (:node args)
+                                            (:state args)))
+                                :insert-event
+                                (assoc-in new-state
+                                          [:undelivered-events
+                                           (:id (:event args))]
+                                          (insert-event!
+                                            t-con
+                                            (:event-schema config)
+                                            (:event args)
+                                            (get-in new-state
+                                                    [:node-states (:sender args)])))
+                                :add-reciever-to-event
+                                (do
+                                  (add-reciever-to-event!
+                                    db
+                                    (get-in new-state [:node-states
+                                                       (:reciever-node args)])
+                                    (get-in new-state [:undelivered-events
+                                                       (:event-id args)]))
+                                  (dissoc-in new-state
+                                             [:undelivered-events
+                                              (:event-id args)]))))
+                            state
+                            reqs))))))))
       q)))
 
 (defn run
@@ -320,11 +436,21 @@
                                (event-validator e))
                              (state-validator node-state'))
                            (when db
-                             ;;TODO we could just cache this id
                              (.put db
-                                   #(let [prev-state-id (latest-state-id-for-node % node current-time)]
-                                      (store-state-for-node!
-                                        % state-schema current-time iters node node-state'))))
+                                   [:store-state-for-node
+                                    {:sim-time current-time
+                                     :sim-step iters
+                                     :node node
+                                     :state node-state'}])
+                             (.put db
+                                   [:add-reciever-to-event
+                                    {:event-id (:id e)
+                                     :reciever-node node}])
+                             (doseq [e fixed-events]
+                               (.put db [:insert-event
+                                         {:event e
+                                          :sender node}]))
+                             (.put db :flush))
                            [(assoc state node node-state')
                             (into events fixed-events)]))
                        [current-node-states []]

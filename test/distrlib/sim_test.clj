@@ -86,10 +86,15 @@
             :event-schema {:lol :kw}
             :state-schema {:count :int}
             :until-time 50}))
+
+  (clojure.pprint/pprint (sim/get-all-events
+    (sim/sqlite-db-spec "broadcast.db")
+    {:lol :kw}
+    {:count :int}))
   
   (clojure.pprint/pprint
     (sim/get-all-states
-      (sim/sqlite-db-spec "broadcast.db")
+      (sim/sqlite-db-spec "broadcast2.db")
       {:count :int}))
 
   (clojure.pprint/pprint
@@ -100,6 +105,14 @@
                        "n1"
                        10
                        ))
+    )
+
+  (jdbc/query (sim/sqlite-db-spec "broadcast.db") "SELECT * FROM primary_events")
+  (sim/get-all-events* (sim/sqlite-db-spec "broadcast.db"))
+
+  (clojure.pprint/pprint
+    (sim/get-all-events* 
+      (sim/sqlite-db-spec "broadcast.db"))
     )
 
   

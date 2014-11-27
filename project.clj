@@ -10,4 +10,5 @@
                  [org.clojure/data.priority-map "0.0.5"]
                  [yesql "0.4.0"]
                  [org.xerial/sqlite-jdbc "3.7.2"]
+                 [seesaw "1.4.4"]
                  [com.mchange/c3p0 "0.9.2.1"]])
