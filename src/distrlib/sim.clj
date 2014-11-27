@@ -1,6 +1,10 @@
 (ns distrlib.sim
   (:refer-clojure :exclude [shuffle])
-  (:require [clojure.data.priority-map :refer (priority-map-keyfn)]))
+  (:require [clojure.data.priority-map :refer (priority-map-keyfn)]
+            [yesql.core :refer (defqueries)]
+            [schema.core :as s]
+            [clojure.java.jdbc :as jdbc])
+  (:import com.mchange.v2.c3p0.ComboPooledDataSource))
 
 (defrecord Message [time dest id])
 
@@ -23,6 +27,14 @@
 (defn timeout?
   [t]
   (instance? Timeout t))
+
+(defn message?
+  [m]
+  (instance? Message m))
+
+(defn event?
+  [e]
+  (or (message? e) (timeout? e)))
 
 (let [a (atom 0)]
   (defn unique
@@ -49,7 +61,7 @@
   (map (fn [e]
          (assoc (cond
                   (instance? Message e)
-                  (assoc-if-nil e :time (+ (network-delay (hash [node now e])) 50 now))
+                  (assoc-if-nil e :time (inc now) #_(+ (network-delay (hash [node now e])) 50 now))
                   (instance? Timeout e)
                   (-> e
                       (assoc-if-nil :dest node)
@@ -65,12 +77,226 @@
 ;;deterministc randomness. We could include builtins like shuffles, RNGs, etc
 ;;probably need a decent hash mixing fn for longs too
 
+(def positive-int (s/both long (s/pred (comp not neg?) 'positive)))
+
+(defn non-empty-coll
+  [schema]
+  (s/both schema
+          (s/pred seq 'non-empty)))
+
+;;; The following are validators for schema for the simulator's extra state
+(def extra-state-schema
+  {(s/both s/Keyword
+           (s/pred #(not (namespace %)) 'without-namespace)
+           (s/pred #(re-matches #"^[a-zA-Z0-9_]+$" (name %)) 'safe-for-db))
+   (s/enum :str :kw :int :obj)})
+
+(def sim-config-map
+  {(s/required-key :actors) (non-empty-coll {s/Keyword (s/pred fn? 'function)})
+   (s/required-key :initial-events) (non-empty-coll [(s/pred event? 'event)])
+   (s/required-key :until-time) positive-int
+   (s/optional-key :seed) long
+   (s/optional-key :validating?) boolean
+   (s/optional-key :store) {(s/required-key :file) s/Str
+                            (s/optional-key :overwrite) boolean
+                            ;; TODO make logging events/state optional
+                            }
+   (s/optional-key :event-schema) extra-state-schema
+   (s/optional-key :state-schema) extra-state-schema})
+
+(defmacro event-validor-helper
+  "Used for simplifying make-event-validator"
+  [pred k what]
+  `(fn [event#]
+     (if (contains? event# ~k)
+       (or (~pred (get event# ~k))
+           (str ~k " should be a " ~what ", was " (get event# ~k)))
+       true)))
+
+(defn make-event-validator
+  "Throws if it sees an event that isn't properly specified (i.e. must
+   have all keys and no extras). Takes the built-in properties + the event
+   schema into consideration."
+  [event-schema]
+  {:pre [(map? event-schema)
+         (not (contains? event-schema :id))
+         (not (contains? event-schema :time))
+         (not (contains? event-schema :dest))]}
+  (let [event-schema (assoc event-schema
+                            :time :int
+                            :dest :kw)
+        validators (map (fn [[k t]]
+                          (case t
+                            :str (event-validor-helper string? k "string")
+                            :kw (event-validor-helper keyword? k "keyword")
+                            :int (event-validor-helper integer? k "int")
+                            :obj (constantly true)))
+                        event-schema)
+        keyset (conj (set (keys event-schema)) :id)]
+    (fn validate [e]
+      (when-not (every? keyset (keys e))
+        (throw (ex-info "Event had extra keys" {:extra-keys (remove keyset (keys e))})))
+      (when-let [errors (seq (reduce (fn [errors v]
+                                       (let [x (v e)]
+                                         (if (string? x)
+                                         (conj errors x)
+                                         errors)))
+                                     []
+                                     validators))]
+        (throw (ex-info (str "Keys failed to validate " errors) {:errors errors})))
+      e)))
+
+;;; TODO: make a visual environment that shows the execution traces rendered as graphs/timeseries
+;;; Need a way to generate logs and view them efficiently on the trace. We'll do this by buffering each step in memory, and then flushing out to a log file (leveldb or sqlite). We'll be able to then serve up the log through another module, which initially will give you a table control that lets you scroll through all events & hover to get datastructure details
+;;; Use https://highlightjs.org/usage/ for datastructure higlighting?
+;;; Should capture every time an event runs, in order. Info includes the node, the message, the time, the start & end state, every log inside the actor, and all generated messages. Should use clojure.tools.logging but need to include richer tracking metadata to ensure the log is useful for the analyzer (in text or db?)
+
+(defn sim-schema->ddl
+  [schema]
+  (map (fn [[column type]]
+         [column (get {:int :int
+                       :str "varchar(32)"
+                       :obj :blob
+                       :kw "varchar(32)"} type)])
+       schema))
+
+(defn state-table
+  "Stores the series of all states in the simulator. The agents
+   can provide additional state to be stored in each state snapshot"
+  [schema]
+  (apply
+    jdbc/create-table-ddl
+    :primary_state
+    [:time :int] ;; represents the simulation time (sparse)
+    [:step :int] ;; represents the step (dense)
+    [:node :int] ;; whose state is this?
+    (sim-schema->ddl schema)))
+
+(defn event-table
+  "Stores the series of all events in the simulator."
+  [schema]
+  (apply
+    jdbc/create-table-ddl
+    :primary_events
+    ;;TODO store delay upfront?
+    [:sender_state :int] ;; id of state of sending node
+    [:reciever_state :int] ;; id of state of receiving node, set upon delivery
+    (sim-schema->ddl schema)))
+
+(defn serialize-map
+  [seed schema state]
+  {:pre [(map? schema) (or (nil? state) (map? state))]}
+  (reduce-kv (fn [result k v]
+               (assoc result k (case (get schema k)
+                                 :str v
+                                 :obj (pr-str v)
+                                 :int v
+                                 :kw (name v))))
+             seed
+             state))
+
+(defn deserialize-map
+  [schema state]
+  {:pre [(map? schema)]}
+  (reduce-kv (fn [result k v]
+               (assoc result k (case (get schema k)
+                                 :obj (read-string v)
+                                 :kw (keyword v)
+                                 v)))
+             {}
+             state))
+
+(defqueries "sql/queries.sql")
+
+(defn store-state-for-node!
+  [db schema sim-time sim-step node state]
+  (let [[{id :rowid}] (find-node-id db (name node))]
+    (-> (jdbc/insert! db :primary_state (serialize-map
+                                      {:time sim-time
+                                       :step sim-step
+                                       :node id}
+                                      schema
+                                      state))
+        first
+        (get (keyword "last_insert_rowid()")))))
+
+(def node-table
+  (jdbc/create-table-ddl
+    :node_names
+    [:name "varchar(32)"]))
+
+(defn populate-node-table!
+  "Nodes should be a seq of keywords"
+  [db nodes]
+  (apply jdbc/insert! db :node_names (map (fn [n] {:name (name n)}) nodes)))
+
+(defn get-all-states
+  "Returns all the state data, joined with node names"
+  [db schema]
+  (map #(-> (deserialize-map schema %)
+            (dissoc :node))
+       (get-all-states* db)))
+
+(defn latest-state-id-for-node
+  "Finds the rowid of the most recent state for a node as of a given time"
+  [db node-name time]
+  (-> (latest-state-id-for-node* db (name node-name) time)
+      (first)
+      (:rowid)))
+
+(defn sqlite-db-spec
+  "Returns a db spec for a sqlite db"
+  [path]
+  {:classname "org.sqlite.JDBC"
+   :subprotocol "sqlite"
+   :subname path})
+
+(defn make-db-pool
+  [spec]
+  (let [cpds (doto (ComboPooledDataSource.)
+               (.setDriverClass (:classname spec))
+               (.setJdbcUrl (str "jdbc:" (:subprotocol spec) ":" (:subname spec)))
+               (.setUser (:user spec))
+               (.setPassword (:password spec))
+               ;; expire excess connections after 30 minutes of inactivity:
+               (.setMaxIdleTimeExcessConnections (* 30 60))
+               ;; expire connections after 3 hours of inactivity:
+               (.setMaxIdleTime (* 3 60 60)))]
+    {:datasource cpds}))
+
+(defn init-db
+  "Intializes the sqlite db and returns the connection or nil if not configured"
+  [config]
+  (when (:store config)
+    (let [path (get-in config [:store :file])
+          db (make-db-pool (sqlite-db-spec path))
+          q (java.util.concurrent.LinkedBlockingQueue.)]
+      (when (and (not (get-in config [:store :overwrite]))
+                 (.exists (java.io.File. path)))
+        (throw (ex-info (str "File already exists:" path) {})))
+      (.delete (java.io.File. path))
+      (jdbc/db-do-commands
+        db
+        node-table
+        (state-table (:state-schema config))
+        (event-table (:event-schema config)))
+      (populate-node-table! db (keys (:actors config)))
+      (.start (Thread. (fn []
+                         (while true
+                           (let [f (.take q)]
+                             (f db))))))
+      q)))
+
 (defn run
   "Takes a map from node names to actors"
-  ([actors initial-events until-time]
-   (run 22 actors initial-events until-time))
-  ([seed actors initial-events until-time]
-   (let [initial-node-states (into {} (map (fn [[node actor]] [node (actor)]) actors))
+  ([{:keys [actors initial-events until-time event-schema state-schema] :as config}]
+   (s/validate sim-config-map config)
+   (let [seed (:seed config 22)
+         validating? (:validating? config true)
+         db (init-db config)
+         event-validator (make-event-validator event-schema)
+         state-validator (make-event-validator state-schema)
+         initial-node-states (into {} (map (fn [[node actor]] [node (actor)]) actors))
          initial-events' (->> initial-events
                               (fixup-events ::root -1)
                               (mapcat (fn [e] [(:id e) e])))]
@@ -87,9 +313,18 @@
                          (let [node (:dest e)
                                actor (get actors node)
                                node-state (get state node)
-                               ;_ (println "event" e "node" node "actor" (boolean actor) )
                                [node-state' new-events] (actor node-state (->SimulatorState current-time seed node) e)
                                fixed-events (fixup-events node current-time new-events)]
+                           (when validating?
+                             (doseq [e fixed-events]
+                               (event-validator e))
+                             (state-validator node-state'))
+                           (when db
+                             ;;TODO we could just cache this id
+                             (.put db
+                                   #(let [prev-state-id (latest-state-id-for-node % node current-time)]
+                                      (store-state-for-node!
+                                        % state-schema current-time iters node node-state'))))
                            [(assoc state node node-state')
                             (into events fixed-events)]))
                        [current-node-states []]
@@ -99,9 +334,3 @@
                next-time (:time (first (vals next-events)) -1)]
            (recur next-time current-time (inc iters) next-state next-events))
          [prev-time current-node-states])))))
-
-
-;;; TODO: make a visual environment that shows the execution traces rendered as graphs/timeseries
-;;; Need a way to generate logs and view them efficiently on the trace. We'll do this by buffering each step in memory, and then flushing out to a log file (leveldb or sqlite). We'll be able to then serve up the log through another module, which initially will give you a table control that lets you scroll through all events & hover to get datastructure details
-;;; Use https://highlightjs.org/usage/ for datastructure higlighting?
-;;; Should capture every time an event runs, in order. Info includes the node, the message, the time, the start & end state, every log inside the actor, and all generated messages. Should use clojure.tools.logging but need to include richer tracking metadata to ensure the log is useful for the analyzer (in text or db?)
