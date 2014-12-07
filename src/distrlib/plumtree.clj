@@ -95,7 +95,7 @@
               (for [peer peers #_(take (max (- (+ 2 (long (Math/ceil (Math/log (count peers)))))
                                               (count push-peers))
                                     0)
-                               (nth-permutation peers (hash simulator-state)))]
+                               (nth-permutation peers (sim/random-from simulator-state)))]
                 (sim/message peer :i-have id :source self)))]
            [state #_(if-not (= ::client source)
                     [(sim/message source :prune self)]

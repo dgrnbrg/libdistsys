@@ -5,25 +5,6 @@
             [distrlib.sim :as sim]
             [clojure.java.jdbc :as jdbc]))
 
-; Make a model for the directory tree
-; we'll store things
-(defn tree-model
-  [config]
-  (simple-tree-model
-    (fn event-branch? [[tag]]
-      (or (= :application-root tag)
-          (= :event tag)))
-    (fn event-children [[tag value]]
-      (if (= :application-root tag)
-        (map vector (repeat :event) (sim/get-all-events
-                                      (sim/sqlite-db-spec
-                                        (get-in config [:store :file]))
-                                      (get config :event-schema)
-                                      (get config :state-schema)))
-        [[:sender (:sender value)]]))
-    [:application-root]))
-
-
 (defn list-from-db
   []
   (let [config {:store {:file "broadcast.db" :overwrite true}
@@ -97,9 +78,18 @@
   [f e]
   (when-let [event (selection e)]
     (config! (select f [:#details-panel])
-             :items [(details-panel {"Event" (dissoc event :sender :reciever)
-                                     "Sender" (:sender event)
-                                     "Reciever" (:reciever event)})])))
+             :items [(details-panel
+                       [["Event" (dissoc event
+                                         :sender
+                                         :reciever
+                                         :sender-logs
+                                         :reciever-logs)]
+                        ["Sender" (:sender event)]
+                        ["Reciever" (:reciever event)]
+                        ["Sender Logs" (zipmap (range)
+                                               (:sender-logs event))]
+                        ["Reciever Logs" (zipmap (range)
+                                                 (:reciever-logs event))]])])))
 
 (defn example []
   (let [time-display-bg (button-group) 

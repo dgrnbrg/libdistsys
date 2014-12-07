@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [shuffle])
   (:require [clojure.data.priority-map :refer (priority-map-keyfn)]
             [yesql.core :refer (defqueries)]
+            [clojure.core.async :as async]
             [clojure.string :as str]
             [schema.core :as s]
             [clojure.java.jdbc :as jdbc])
@@ -71,12 +72,25 @@
                 :id (unique)))
        events))
 
-(defrecord SimulatorState [^long time ^long seed node])
+(defrecord SimulatorState [^long time ^long seed node q])
 ;;TODO stick this record into every actor callback arg
 ;;ensure that the run lets you prepopulate this state w/ whatever crap you want
 ;;perhaps a seed should be stored here, too, since we'd really like to have
 ;;deterministc randomness. We could include builtins like shuffles, RNGs, etc
 ;;probably need a decent hash mixing fn for longs too
+
+(defn random-from
+  "Returns a random number based on the given simulator state"
+  [state]
+  (hash [(:time state) (:seed state) (:node state)]))
+
+(defn log
+  "Logs a message to the DB from the given algo"
+  [state & msgs]
+  (when-let [q (:q state)]
+    (async/>!! q [:log {:sim-time (:time state)
+                        :node (:node state)
+                        :msg (str/join \space msgs)}])))
 
 (def positive-int (s/both long (s/pred (comp not neg?) 'positive)))
 
@@ -249,6 +263,22 @@
         first
         (get (keyword "last_insert_rowid()")))))
 
+(def log-table
+  (jdbc/create-table-ddl
+    :user_logs
+    [:node :int]
+    [:time :int]
+    [:msg "varchar(255)"]))
+
+(defn store-log-for-node!
+  "Stores a log into the log table"
+  [db time node msg]
+  (-> (jdbc/insert! db :user_logs {:time time
+                                   :node (lookup-node-name->id db node)
+                                   :msg msg})
+      first
+      (get (keyword "last_insert_rowid()"))))
+
 (def node-table
   (jdbc/create-table-ddl
     :node_names
@@ -287,18 +317,34 @@
   [db event-schema state-schema]
   (->> (get-all-events* db)
        (map (fn [raw-event]
-              (let [sender-state (-> (first (get-state-by-state-id db (:sender_state raw-event)))
-                                     (update-in [:node] (partial lookup-node-id->name db))
+              (let [sender-state-raw (first (get-state-by-state-id
+                                              db
+                                              (:sender_state raw-event)))
+                    sender-state (-> sender-state-raw
+                                     (update-in [:node]
+                                                (partial lookup-node-id->name db))
                                      (remove-nil-values))
-                    recvr-state (-> (first (get-state-by-state-id db (:reciever_state raw-event)))
-                                    (update-in [:node] (partial lookup-node-id->name db))
-                                    (remove-nil-values))]
+                    recvr-state-raw (first (get-state-by-state-id
+                                             db
+                                             (:reciever_state raw-event)))
+                    recvr-state (-> recvr-state-raw
+                                    (update-in [:node]
+                                               (partial lookup-node-id->name db))
+                                    (remove-nil-values))
+                    sender-logs (get-logs db
+                                          (:time sender-state-raw)
+                                          (:node sender-state-raw))
+                    recvr-logs (get-logs db
+                                         (:time recvr-state-raw)
+                                         (:node recvr-state-raw))]
                 (-> raw-event
                     (dissoc :sender_state :destination_node :reciever_state)
                     (assoc :sender sender-state
                            :reciever recvr-state
                            :dest (lookup-node-id->name
-                                   db (:destination_node raw-event)))
+                                   db (:destination_node raw-event))
+                           :reciever-logs recvr-logs
+                           :sender-logs sender-logs)
                     (remove-nil-values)))))))
 
 (defn sqlite-db-spec
@@ -336,13 +382,81 @@
       m)
     (dissoc m k)))
 
+(defn check-start-or-close-event
+  "Throws if the given event isn't a start event"
+  [[tag node] db]
+  (if (= tag :close)
+    (do (.close db)
+        false)
+    (do (when (not= tag :start-event)
+          (throw (ex-info "Not a start event" {:tag tag :node node})))
+        node)))
+
+(defn batch-requests
+  "Reads from a channel until it sees a :flush value, then returns the
+   accumuluated buffer"
+  [chan]
+  (async/go
+    (loop [buf []]
+      (let [e (async/<! chan)]
+        (if (= e :flush)
+          buf
+          (recur (conj buf e)))))))
+
+(defn reduce-db-event
+  "Curried reducing function. First, you pass it the config & database,
+   then, it returns the reducing function which will work on a sequence
+   of tagged events, adding them to the db and updating the tracking state."
+  [config db]
+  (fn reduce-db-event-impl [new-state [action args]]
+    (case action
+      :log
+      (do
+        (store-log-for-node!
+          db
+          (:sim-time args)
+          (:node args)
+          (:msg args))
+        new-state)
+      :store-state-for-node
+      (assoc-in new-state
+                [:node-states (:node args)]
+                (store-state-for-node!
+                  db
+                  (:state-schema config)
+                  (:sim-time args)
+                  (:sim-step args)
+                  (:node args)
+                  (:state args)))
+      :insert-event
+      (assoc-in new-state
+                [:undelivered-events
+                 (:id (:event args))]
+                (insert-event!
+                  db
+                  (:event-schema config)
+                  (:event args)
+                  (get-in new-state
+                          [:node-states (:sender args)])))
+      :add-reciever-to-event
+      (do
+        (add-reciever-to-event!
+          db
+          (get-in new-state [:node-states
+                             (:reciever-node args)])
+          (get-in new-state [:undelivered-events
+                             (:event-id args)]))
+        (dissoc-in new-state
+                   [:undelivered-events
+                    (:event-id args)])))))
+
 (defn init-db
   "Intializes the sqlite db and returns the connection or nil if not configured"
   [config]
   (when (:store config)
     (let [path (get-in config [:store :file])
           db (make-db-pool (sqlite-db-spec path))
-          q (java.util.concurrent.LinkedBlockingQueue.)]
+          q (async/chan (async/buffer 10000))]
       (when (and (not (get-in config [:store :overwrite]))
                  (.exists (java.io.File. path)))
         (throw (ex-info (str "File already exists:" path) {})))
@@ -350,57 +464,16 @@
       (jdbc/db-do-commands
         db
         node-table
+        log-table
         (state-table (:state-schema config))
         (event-table (:event-schema config)))
       (populate-node-table! db (keys (:actors config)))
-      (.start
-        (Thread.
-          (fn []
-            (loop [state {:node-states {}
-                          :undelivered-events {}}]
-              (let [reqs (loop [buf []]
-                           (let [e (.take q)]
-                             (if (= e :flush)
-                               buf
-                               (recur (conj buf e)))))]
-                (println "Flushing these reqs:" reqs)
-                (recur
-                  (let [t-con db]
-                    (reduce (fn [new-state [action args]]
-                              (case action
-                                :store-state-for-node
-                                (assoc-in new-state
-                                          [:node-states (:node args)]
-                                          (store-state-for-node!
-                                            t-con
-                                            (:state-schema config)
-                                            (:sim-time args)
-                                            (:sim-step args)
-                                            (:node args)
-                                            (:state args)))
-                                :insert-event
-                                (assoc-in new-state
-                                          [:undelivered-events
-                                           (:id (:event args))]
-                                          (insert-event!
-                                            t-con
-                                            (:event-schema config)
-                                            (:event args)
-                                            (get-in new-state
-                                                    [:node-states (:sender args)])))
-                                :add-reciever-to-event
-                                (do
-                                  (add-reciever-to-event!
-                                    db
-                                    (get-in new-state [:node-states
-                                                       (:reciever-node args)])
-                                    (get-in new-state [:undelivered-events
-                                                       (:event-id args)]))
-                                  (dissoc-in new-state
-                                             [:undelivered-events
-                                              (:event-id args)]))))
-                            state
-                            reqs))))))))
+      (async/go
+        (loop [state {:node-states {}
+                      :undelivered-events {}}]
+          (when-let [node (check-start-or-close-event (async/<! q) (:datasource db))]
+            (let [reqs (async/<! (batch-requests q))]
+              (recur (reduce (reduce-db-event config db) state reqs))))))
       q)))
 
 (defn run
@@ -409,7 +482,7 @@
    (s/validate sim-config-map config)
    (let [seed (:seed config 22)
          validating? (:validating? config true)
-         db (init-db config)
+         db-chan (init-db config)
          event-validator (make-event-validator event-schema)
          state-validator (make-event-validator state-schema)
          initial-node-states (into {} (map (fn [[node actor]] [node (actor)]) actors))
@@ -427,30 +500,31 @@
                [next-state new-events]
                (reduce (fn [[state events] e]
                          (let [node (:dest e)
+                               _ (when db-chan (async/>!! db-chan [:start-event node]))
                                actor (get actors node)
                                node-state (get state node)
-                               [node-state' new-events] (actor node-state (->SimulatorState current-time seed node) e)
+                               [node-state' new-events] (actor node-state (->SimulatorState current-time seed node db-chan) e)
                                fixed-events (fixup-events node current-time new-events)]
                            (when validating?
                              (doseq [e fixed-events]
                                (event-validator e))
                              (state-validator node-state'))
-                           (when db
-                             (.put db
+                           (when db-chan
+                             (async/>!! db-chan
                                    [:store-state-for-node
                                     {:sim-time current-time
                                      :sim-step iters
                                      :node node
                                      :state node-state'}])
-                             (.put db
+                             (async/>!! db-chan
                                    [:add-reciever-to-event
                                     {:event-id (:id e)
                                      :reciever-node node}])
                              (doseq [e fixed-events]
-                               (.put db [:insert-event
+                               (async/>!! db-chan [:insert-event
                                          {:event e
                                           :sender node}]))
-                             (.put db :flush))
+                             (async/>!! db-chan :flush))
                            [(assoc state node node-state')
                             (into events fixed-events)]))
                        [current-node-states []]
@@ -459,4 +533,5 @@
                                  (map (fn [e] [(:id e) e]) new-events))
                next-time (:time (first (vals next-events)) -1)]
            (recur next-time current-time (inc iters) next-state next-events))
-         [prev-time current-node-states])))))
+         (do (when db-chan (async/>!! db-chan [:close]))
+             [prev-time current-node-states]))))))

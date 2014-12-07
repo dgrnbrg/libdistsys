@@ -11,4 +11,5 @@
                  [yesql "0.4.0"]
                  [org.xerial/sqlite-jdbc "3.7.2"]
                  [seesaw "1.4.4"]
+                 [org.clojure/core.async "0.1.346.0-17112a-alpha"]
                  [com.mchange/c3p0 "0.9.2.1"]])

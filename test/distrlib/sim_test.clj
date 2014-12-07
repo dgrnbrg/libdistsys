@@ -13,7 +13,8 @@
   [targets payload interval]
   (fn
     ([] nil)
-    ([state _ msg]
+    ([state sim msg]
+     (sim/log sim "Broadcasting now!")
      [state (conj (map (fn [node] (merge (sim/message node)
                                          payload))
                        targets)
@@ -22,7 +23,8 @@
 (defn counter
   "This is a sim actor that counts how many messages it recieved"
   ([] {:count 0})
-  ([{:keys [count]} _ msg]
+  ([{:keys [count]} sim msg]
+   (sim/log sim "Hello at " msg)
    [{:count (inc count)}]))
 
 (defn run-broadcast-sim
@@ -52,6 +54,7 @@
               :event-schema event-schema
               :state-schema state-schema
               :until-time 50})
+    (Thread/sleep 1000)
     (is (= 40 (count (sim/get-all-states
                        (sim/sqlite-db-spec "broadcast.db")
                        state-schema))))
@@ -86,6 +89,10 @@
             :event-schema {:lol :kw}
             :state-schema {:count :int}
             :until-time 50}))
+
+  (clojure.pprint/pprint
+    (jdbc/query (sim/sqlite-db-spec "broadcast.db")
+                "SELECT * FROM user_logs"))
 
   (clojure.pprint/pprint (sim/get-all-events
     (sim/sqlite-db-spec "broadcast.db")
@@ -166,7 +173,7 @@
                     state
                     (conj state msg-stamp))
            fwd-peers (take (+ 2 (long (Math/ceil (Math/log (count peers)))))
-                           (nth-permutation peers (hash simulator-state)))
+                           (nth-permutation peers (sim/random-from simulator-state)))
            fwd-msgs (map (fn [p] (sim/message p :stamp msg-stamp)) fwd-peers)]
        [{:state state'} (when (not= state state') fwd-msgs)]))))
 
