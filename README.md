@@ -98,7 +98,7 @@ PN counters are linear in size with the number of actors that have ever affected
 
 ## Testing
 
-The above listed features are tested using generative testing to verify their propertie to verify their properties
+The above listed features are tested using generative testing to verify their properties
 
 ## License
 
