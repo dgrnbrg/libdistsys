@@ -4,6 +4,7 @@
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :jvm-opts ["-XX:-OmitStackTraceInFastThrow"]
+  :test-selectors {:default (fn [m] (not (:disabled m)))}
   :dependencies [[org.clojure/clojure "1.6.0"]
                  [org.clojure/test.check "0.6.1"]
                  [prismatic/schema "0.3.3"]

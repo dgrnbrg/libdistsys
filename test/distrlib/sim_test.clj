@@ -39,7 +39,7 @@
             :state-schema {:count :int}
             :until-time limit}))
 
-(deftest test-sql-on-broadcast
+(deftest ^:disabled test-sql-on-broadcast
   (let [db (sim/sqlite-db-spec "broadcast.db")
         state-schema {:count :int}
         event-schema {:lol :kw}]
