@@ -100,6 +100,10 @@ PN counters are linear in size with the number of actors that have ever affected
 
 The above listed features are tested using generative testing to verify their propertie to verify their properties
 
+## Contributors
+
+Thanks to Russell Brown (@russelldb) for coming up with the original implementation of Orswots in Erlang, on whose code this library's implementation of Orswots is based.
+
 ## License
 
 Copyright © 2014, 2015 David Greenberg
